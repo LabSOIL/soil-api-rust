@@ -94,6 +94,8 @@ pub fn parse_instrument_file(text: &str) -> Result<ParsedInstrumentFile, Instrum
     let (time_values, channel_values) =
         parse_data_rows(&lines, header_idx, delimiter, header_tokens.len())?;
     let preamble = parse_preamble(&lines[..header_idx]);
+    let time_values = reconstruct_uniform_time(&time_values, preamble.sample_interval)
+        .unwrap_or(time_values);
     let date = lines.first().and_then(|line| parse_date(line));
 
     Ok(ParsedInstrumentFile {
@@ -169,6 +171,79 @@ fn parse_data_rows(
     Ok((time_values, channel_values))
 }
 
+/// Recovers the instrument's uniform sampling grid from a time column whose
+/// printed precision has collapsed below the sampling interval.
+///
+/// CHI exports print the time column with four significant figures (`%.3e`)
+/// while sampling on an internal uniform clock. Once the elapsed time exceeds
+/// 10^4 sampling intervals the printed step is coarser than the real one and
+/// consecutive rows repeat the same timestamp (e.g. 1.001e+4 twice for the
+/// samples at 10005 s and 10010 s). The currents keep their own resolution,
+/// so only the time axis degrades.
+///
+/// A candidate grid `t[0] + i * dt` is accepted only when rounding it to a
+/// fixed number of significant figures reproduces every printed value; the
+/// grid is then the time base the instrument sampled on. Files that fail the
+/// check (pauses, genuinely irregular sampling) keep their own values.
+fn reconstruct_uniform_time(
+    time_values: &[f64],
+    header_interval: Option<f64>,
+) -> Option<Vec<f64>> {
+    let n = time_values.len();
+    if n < 3 {
+        return None;
+    }
+    // Only repeated timestamps mark a collapsed resolution; leave strictly
+    // increasing columns untouched and reject decreasing ones outright.
+    if !time_values.windows(2).any(|w| w[1] == w[0]) {
+        return None;
+    }
+    if time_values.windows(2).any(|w| w[1] < w[0]) {
+        return None;
+    }
+
+    let mut candidates: Vec<f64> = Vec::new();
+    if let Some(dt) = header_interval {
+        if dt > 0.0 {
+            candidates.push(dt);
+        }
+    }
+    let mut steps: Vec<f64> = time_values
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|step| *step > 0.0)
+        .collect();
+    steps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    steps.dedup();
+    candidates.extend(steps);
+
+    let t0 = time_values[0];
+    for dt in candidates {
+        let grid: Vec<f64> = (0..n).map(|i| dt.mul_add(i as f64, t0)).collect();
+        for digits in 3..=9 {
+            let matches = grid.iter().zip(time_values).all(|(&exact, &printed)| {
+                let rounded = round_significant(exact, digits);
+                (rounded - printed).abs() <= printed.abs().max(1.0) * 1e-9
+            });
+            if matches {
+                return Some(grid);
+            }
+        }
+    }
+    None
+}
+
+/// Rounds to a number of significant figures with ties away from zero,
+/// matching the instrument's print format.
+fn round_significant(value: f64, digits: i32) -> f64 {
+    if value == 0.0 {
+        return 0.0;
+    }
+    let magnitude = value.abs().log10().floor() as i32;
+    let quantum = 10f64.powi(magnitude - digits + 1);
+    (value / quantum).round() * quantum
+}
+
 fn parse_date(line: &str) -> Option<DateTime<Utc>> {
     let mut tokens: Vec<&str> = line.split_whitespace().collect();
     let month = tokens.first()?.trim_end_matches('.');
@@ -242,8 +317,17 @@ mod tests {
     use chrono::TimeZone;
 
     const CHI1000B_TAB: &str = include_str!("fixtures/chi1000b_tab.txt");
+    const CHI1000B_TAB_QUANTIZED: &str = include_str!("fixtures/chi1000b_tab_quantized.txt");
     const CHI1030C_COMMA: &str = include_str!("fixtures/chi1030c_comma.txt");
     const CHI1030C_6COL_COMMA: &str = include_str!("fixtures/chi1030c_6col_comma.txt");
+
+    /// Prints a uniform grid the way the instrument does: four significant
+    /// figures with ties away from zero.
+    fn quantized_grid(t0: f64, dt: f64, n: usize) -> (Vec<f64>, Vec<f64>) {
+        let exact: Vec<f64> = (0..n).map(|i| dt.mul_add(i as f64, t0)).collect();
+        let printed: Vec<f64> = exact.iter().map(|&t| round_significant(t, 4)).collect();
+        (exact, printed)
+    }
 
     #[test]
     fn test_parse_instrument_file_tab_delimited() {
@@ -299,6 +383,55 @@ mod tests {
             vec!["i1/A", "i2/A", "i3/A", "i5/A", "i6/A", "i7/A"]
         );
         assert_eq!(parsed.channel_values.len(), 6);
+    }
+
+    #[test]
+    fn test_parse_quantized_export_reconstructs_time() {
+        // Real CHI1000B rows crossing 10^4 s, where the printed time column
+        // repeats (1.001e+4 stands for both 10005 s and 10010 s)
+        let parsed = parse_instrument_file(CHI1000B_TAB_QUANTIZED).unwrap();
+
+        let expected: Vec<f64> = (0..15).map(|i| f64::from(i).mul_add(5.0, 9980.0)).collect();
+        assert_eq!(parsed.time_values, expected);
+        // Currents stay verbatim
+        assert!((parsed.channel_values[1][13] - 9.224e-5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_reconstruct_time_round_trip() {
+        let (exact, printed) = quantized_grid(5.0, 5.0, 3314);
+        assert!(printed.windows(2).any(|w| w[1] == w[0]), "fixture must contain duplicates");
+        assert_eq!(reconstruct_uniform_time(&printed, Some(5.0)), Some(exact.clone()));
+        // The sampling interval is recoverable from the steps alone
+        assert_eq!(reconstruct_uniform_time(&printed, None), Some(exact));
+    }
+
+    #[test]
+    fn test_reconstruct_time_subsecond_interval() {
+        let (exact, printed) = quantized_grid(0.5, 0.5, 40_000);
+        assert_eq!(reconstruct_uniform_time(&printed, Some(0.5)), Some(exact));
+    }
+
+    #[test]
+    fn test_reconstruct_time_leaves_clean_columns() {
+        let exact: Vec<f64> = (0..500).map(|i| f64::from(i) * 5.0).collect();
+        assert_eq!(reconstruct_uniform_time(&exact, Some(5.0)), None);
+    }
+
+    #[test]
+    fn test_reconstruct_time_rejects_interrupted_runs() {
+        let (_, mut printed) = quantized_grid(5.0, 5.0, 3000);
+        for value in &mut printed[2500..] {
+            *value += 1000.0;
+        }
+        assert_eq!(reconstruct_uniform_time(&printed, Some(5.0)), None);
+    }
+
+    #[test]
+    fn test_reconstruct_time_rejects_decreasing_columns() {
+        let (_, mut printed) = quantized_grid(5.0, 5.0, 3000);
+        printed[100] = 400.0;
+        assert_eq!(reconstruct_uniform_time(&printed, Some(5.0)), None);
     }
 
     #[test]

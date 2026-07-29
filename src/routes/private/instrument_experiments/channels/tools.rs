@@ -18,8 +18,9 @@ pub fn calculate_spline(
     baseline_selected_points: &[f64],
     interpolation_method: &str,
 ) -> Vec<f64> {
-    // Build pairs (baseline point, corresponding y value)
-    let pairs: Vec<(f64, f64)> = baseline_selected_points
+    // Build pairs (baseline point, corresponding y value); duplicate picks
+    // at the same x would give the interpolation a zero-width segment
+    let mut pairs: Vec<(f64, f64)> = baseline_selected_points
         .iter()
         .filter_map(|&bp| {
             x.iter()
@@ -27,6 +28,8 @@ pub fn calculate_spline(
                 .map(|i| (bp, y[i]))
         })
         .collect();
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    pairs.dedup_by(|a, b| a.0 == b.0);
 
     if pairs.is_empty() {
         return vec![0.0; x.len()];
@@ -104,6 +107,11 @@ pub fn integrate_trapz(x: &[f64], y: &[f64]) -> f64 {
 /// scipy's Cartwright correction: a parabola through the last three points is
 /// integrated over the last interval only.
 ///
+/// Instrument exports can repeat a timestamp when the recorded time has fewer
+/// significant digits than the sampling interval. A parabola is undefined over
+/// such a zero-width interval, so those blocks fall back to the trapezoidal
+/// rule, which keeps the total span and stays finite.
+///
 /// # Arguments
 /// - `x`: Slice of x values.
 /// - `y`: Slice of y values (must be the same length as `x`).
@@ -120,19 +128,27 @@ pub fn integrate_simpson(x: &[f64], y: &[f64]) -> f64 {
     while i + 2 < n {
         let h0 = x[i + 1] - x[i];
         let h1 = x[i + 2] - x[i + 1];
-        area += (h0 + h1) / 6.0
-            * ((2.0 - h1 / h0) * y[i]
-                + ((h0 + h1).powi(2) / (h0 * h1)) * y[i + 1]
-                + (2.0 - h0 / h1) * y[i + 2]);
+        if h0 <= 0.0 || h1 <= 0.0 {
+            area += integrate_trapz(&x[i..=i + 2], &y[i..=i + 2]);
+        } else {
+            area += (h0 + h1) / 6.0
+                * ((2.0 - h1 / h0) * y[i]
+                    + ((h0 + h1).powi(2) / (h0 * h1)) * y[i + 1]
+                    + (2.0 - h0 / h1) * y[i + 2]);
+        }
         i += 2;
     }
     if (n - 1) % 2 == 1 {
         let h0 = x[n - 2] - x[n - 3];
         let h1 = x[n - 1] - x[n - 2];
-        let alpha = (2.0 * h1 * h1 + 3.0 * h0 * h1) / (6.0 * (h0 + h1));
-        let beta = (h1 * h1 + 3.0 * h0 * h1) / (6.0 * h0);
-        let eta = h1.powi(3) / (6.0 * h0 * (h0 + h1));
-        area += alpha * y[n - 1] + beta * y[n - 2] - eta * y[n - 3];
+        if h0 <= 0.0 || h1 <= 0.0 {
+            area += integrate_trapz(&x[n - 2..=n - 1], &y[n - 2..=n - 1]);
+        } else {
+            let alpha = (2.0 * h1 * h1 + 3.0 * h0 * h1) / (6.0 * (h0 + h1));
+            let beta = (h1 * h1 + 3.0 * h0 * h1) / (6.0 * h0);
+            let eta = h1.powi(3) / (6.0 * h0 * (h0 + h1));
+            area += alpha * y[n - 1] + beta * y[n - 2] - eta * y[n - 3];
+        }
     }
     area
 }
@@ -186,22 +202,36 @@ pub fn calculate_integrals_for_pairs(
 ) -> Vec<serde_json::Value> {
     let mut integration_results = Vec::new();
 
+    // A mismatched baseline (e.g. cleared after ranges were chosen) cannot
+    // be integrated against the time axis
+    if baseline_values.len() != time_values.len() {
+        return integration_results;
+    }
+
     for pair in pairs {
-        let start = pair
+        // Pairs still missing an endpoint are not integrable
+        let Some(start) = pair
             .get("start")
             .and_then(|v| v.get("x"))
             .and_then(sea_orm::JsonValue::as_f64)
-            .unwrap_or(0.0);
-        let end = pair
+        else {
+            continue;
+        };
+        let Some(end) = pair
             .get("end")
             .and_then(|v| v.get("x"))
             .and_then(sea_orm::JsonValue::as_f64)
-            .unwrap_or(0.0);
+        else {
+            continue;
+        };
 
+        // Repeated timestamps are matched at their outer edges so the full
+        // range is integrated regardless of which sample the click landed on.
         let start_index = time_values.iter().position(|&v| (v - start).abs() < 1e-6);
-        let end_index = time_values.iter().position(|&v| (v - end).abs() < 1e-6);
+        let end_index = time_values.iter().rposition(|&v| (v - end).abs() < 1e-6);
 
         if let (Some(si), Some(ei)) = (start_index, end_index) {
+            let (si, ei) = if si <= ei { (si, ei) } else { (ei, si) };
             let x_slice = &time_values[si..=ei];
             let y_slice = &baseline_values[si..=ei];
             let area = calculate_integral_for_range(x_slice, y_slice, integration_method);
@@ -273,6 +303,38 @@ mod tests {
         assert!((integrate_trapz(&x, &y) - 107.013_515_555_057_24).abs() < 1e-9);
     }
 
+    /// Timestamps printed with fewer digits than the sampling interval repeat,
+    /// leaving zero-width intervals inside the integration range.
+    fn repeated_timestamp_series() -> (Vec<f64>, Vec<f64>) {
+        let mut x = vec![0.0];
+        for i in 1..20 {
+            x.push(f64::from(i / 2 * 10));
+        }
+        let y: Vec<f64> = (0..20).map(|i| (f64::from(i) / 4.0).sin() + 2.0).collect();
+        (x, y)
+    }
+
+    #[test]
+    fn test_integrate_simpson_handles_repeated_timestamps() {
+        let (x, y) = repeated_timestamp_series();
+        let simpson = integrate_simpson(&x, &y);
+        assert!(simpson.is_finite(), "simpson returned {simpson}");
+        assert!((simpson - integrate_trapz(&x, &y)).abs() / simpson.abs() < 0.05);
+    }
+
+    #[test]
+    fn test_calculate_integrals_for_pairs_with_repeated_timestamps() {
+        let (time_values, baseline_values) = repeated_timestamp_series();
+        let pairs = vec![json!({"start": {"x": 0.0}, "end": {"x": 90.0}, "sample_name": "a"})];
+        let results =
+            calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "simpson");
+        let area = results[0]
+            .get("area")
+            .and_then(serde_json::Value::as_f64)
+            .expect("area should serialise as a number, not null");
+        assert!(area.is_finite());
+    }
+
     #[test]
     fn test_calculate_integral_for_range_converts_to_moles() {
         let (x, y) = sine_series(11);
@@ -302,6 +364,85 @@ mod tests {
             .unwrap();
         assert!((area - expected).abs() < 1e-15);
         assert_eq!(results[1].get("sample_name").unwrap(), "b");
+    }
+
+    #[test]
+    fn test_calculate_integrals_skips_incomplete_pairs() {
+        let (time_values, baseline_values) = sine_series(11);
+        let pairs = vec![
+            json!({"start": {"x": 0.0}}),
+            json!({"start": {"x": 5.0}, "end": {"x": 25.0}, "sample_name": "a"}),
+        ];
+        let results =
+            calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("sample_name").unwrap(), "a");
+    }
+
+    #[test]
+    fn test_calculate_integrals_requires_matching_baseline() {
+        let (time_values, _) = sine_series(11);
+        let pairs = vec![json!({"start": {"x": 0.0}, "end": {"x": 25.0}, "sample_name": "a"})];
+        let results = calculate_integrals_for_pairs(&pairs, &[], &time_values, "trapz");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_calculate_spline_ignores_duplicate_picks() {
+        let (x, y) = sine_series(10);
+        let spline = calculate_spline(&x, &y, &[0.0, 20.0, 20.0, 45.0], "linear");
+        assert!(spline.iter().all(|v| v.is_finite()));
+    }
+
+    /// The workflow the API serves (pair selection, trapezoidal integration,
+    /// conversion to moles) must reproduce the SOIL lab's MATLAB outputs on
+    /// the lab's own data; the same fixtures back lab-codes
+    /// tests/test_integration.py.
+    #[test]
+    fn test_served_integration_matches_matlab_reference() {
+        let baseline_csv = include_str!("../fixtures/matlab_baseline_filtered.csv");
+        let integral_csv = include_str!("../fixtures/matlab_integral_output.csv");
+
+        let mut lines = baseline_csv.lines();
+        let header: Vec<&str> = lines.next().unwrap().trim().split(',').collect();
+        let rows: Vec<Vec<f64>> = lines
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                l.trim()
+                    .split(',')
+                    .map(|v| v.parse::<f64>().unwrap())
+                    .collect()
+            })
+            .collect();
+        let time: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+
+        let mut checked = 0;
+        for line in integral_csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            let fields: Vec<&str> = line.trim().split(',').collect();
+            let measurement = fields[0];
+            let start: f64 = fields[1].parse().unwrap();
+            let end: f64 = fields[2].parse().unwrap();
+            let reference_mol: f64 = fields[4].parse().unwrap();
+
+            let col = header.iter().position(|h| *h == measurement).unwrap();
+            let baseline: Vec<f64> = rows.iter().map(|r| r[col]).collect();
+            let pairs = vec![json!({
+                "start": {"x": start},
+                "end": {"x": end},
+                "sample_name": measurement,
+            })];
+
+            let results = calculate_integrals_for_pairs(&pairs, &baseline, &time, "trapz");
+            assert_eq!(results.len(), 1, "no result for {measurement}");
+            let area = results[0]
+                .get("area")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap();
+            let rel_err = ((area - reference_mol) / reference_mol).abs();
+            assert!(rel_err < 1e-3, "measurement {measurement}: rel err {rel_err}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no reference rows checked");
     }
 
     #[test]

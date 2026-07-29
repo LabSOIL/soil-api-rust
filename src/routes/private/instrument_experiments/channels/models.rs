@@ -198,11 +198,13 @@ impl CRUDResource for InstrumentExperimentChannel {
                     serde_json::from_value(json).unwrap_or_default()
                 });
 
+            // Trapezoidal rule as in the lab's MATLAB reference
+            // (MER_MEO_Eval_003.m) and the lab-codes workflow default
             let integral_results = super::tools::calculate_integrals_for_pairs(
                 &integral_chosen_pairs,
                 &baseline_values,
                 &time_values,
-                "simpson",
+                "trapz",
             );
 
             active_model.integral_results =

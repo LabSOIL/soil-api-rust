@@ -3393,7 +3393,7 @@ dependencies = [
 
 [[package]]
 name = "soil-api"
-version = "2.4.0"
+version = "2.4.1"
 dependencies = [
  "async-std",
  "async-trait",

@@ -517,6 +517,134 @@ mod tests {
         Router::new().nest("/api/instrument_experiments", router)
     }
 
+    fn setup_app_with_channels(db: &DatabaseConnection) -> Router {
+        let (experiments, _) = router(db, None).split_for_parts();
+        let (channels, _) =
+            crate::routes::private::instrument_experiments::channels::views::router(db, None)
+                .split_for_parts();
+        Router::new()
+            .nest("/api/instrument_experiments", experiments)
+            .nest("/api/instrument_channels", channels)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        from_slice(&body_bytes).unwrap()
+    }
+
+    async fn put_channel(
+        app: &Router,
+        id: &str,
+        payload: &serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/instrument_channels/{id}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn floats(value: &serde_json::Value) -> Vec<f64> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect()
+    }
+
+    /// The integration the API serves must run on the baseline-corrected
+    /// signal, never on the raw currents. The fixture separates the two: a
+    /// linear drift carries a triangular peak, so integrating the raw signal
+    /// gives an answer an order of magnitude larger than the peak's own area.
+    #[tokio::test]
+    async fn test_channel_update_integrates_the_corrected_signal() {
+        let db = setup_database().await;
+        let app = setup_app_with_channels(&db);
+
+        let experiment = body_json(post_experiment(&app, &json!({"name": "Integration"})).await).await;
+        let experiment_id: Uuid = experiment["id"].as_str().unwrap().parse().unwrap();
+
+        let time: Vec<f64> = (0..=10).map(f64::from).collect();
+        let peak = [0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let raw: Vec<f64> = time
+            .iter()
+            .zip(peak)
+            .map(|(t, p)| 0.5f64.mul_add(*t, 10.0) + p)
+            .collect();
+
+        let channel_id = Uuid::new_v4();
+        let channel = channel_db::ActiveModel {
+            id: sea_orm::ActiveValue::Set(channel_id),
+            channel_name: sea_orm::ActiveValue::Set("i1/A".to_string()),
+            experiment_id: sea_orm::ActiveValue::Set(experiment_id),
+            baseline_spline: sea_orm::ActiveValue::Set(None),
+            time_values: sea_orm::ActiveValue::Set(Some(json!(time))),
+            raw_values: sea_orm::ActiveValue::Set(Some(json!(raw))),
+            baseline_values: sea_orm::ActiveValue::Set(None),
+            baseline_chosen_points: sea_orm::ActiveValue::Set(None),
+            integral_chosen_pairs: sea_orm::ActiveValue::Set(None),
+            integral_results: sea_orm::ActiveValue::Set(None),
+        };
+        channel_db::Entity::insert(channel)
+            .exec_without_returning(&db)
+            .await
+            .unwrap();
+        let channel_id = channel_id.to_string();
+
+        // Baseline picks sit on the drift, either side of the peak
+        let response = put_channel(
+            &app,
+            &channel_id,
+            &json!({"baseline_chosen_points": [{"x": 0.0, "y": 10.0}, {"x": 10.0, "y": 15.0}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let channel = body_json(response).await;
+
+        let corrected = floats(&channel["baseline_values"]);
+        for (got, want) in corrected.iter().zip(peak) {
+            assert!((got - want).abs() < 1e-12, "corrected {got} != peak {want}");
+        }
+
+        let response = put_channel(
+            &app,
+            &channel_id,
+            &json!({"integral_chosen_pairs": [{
+                "start": {"x": 3.0, "y": 0.0},
+                "end": {"x": 7.0, "y": 0.0},
+                "sample_name": "peak",
+            }]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let channel = body_json(response).await;
+
+        let trapz = |y: &[f64]| -> f64 {
+            y.windows(2).map(|w| f64::midpoint(w[0], w[1])).sum::<f64>()
+        };
+        const FARADAY: f64 = 96_485.332_12;
+        let corrected_area = trapz(&peak[3..=7]) / FARADAY;
+        let raw_area = trapz(&raw[3..=7]) / FARADAY;
+
+        let area = channel["integral_results"][0]["area"].as_f64().unwrap();
+        assert!(
+            (area - corrected_area).abs() < 1e-15,
+            "served area {area} != corrected-signal area {corrected_area}"
+        );
+        assert!(
+            (area - raw_area).abs() > 1e-6,
+            "served area matches the raw-signal area {raw_area}"
+        );
+        assert_eq!(channel["integral_results"][0]["sample_name"], "peak");
+    }
+
     async fn post_experiment(app: &Router, payload: &serde_json::Value) -> axum::response::Response {
         app.clone()
             .oneshot(
