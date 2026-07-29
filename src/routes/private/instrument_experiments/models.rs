@@ -4,11 +4,13 @@ use chrono::{DateTime, Utc};
 use crudcrate::{CRUDResource, ToCreateModel, ToUpdateModel, traits::MergeIntoActiveModel};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait,
-    Order, QueryOrder, QuerySelect, entity::prelude::*,
+    Order, QueryOrder, QuerySelect, TransactionTrait, entity::prelude::*,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+pub const UNSUPPORTED_FILE: &str = "unsupported_file: ";
 
 #[derive(ToSchema, Serialize, Deserialize, ToCreateModel, ToUpdateModel)]
 #[active_model = "super::db::ActiveModel"]
@@ -35,6 +37,8 @@ pub struct InstrumentExperiment {
     pub channels: Vec<super::channels::models::InstrumentExperimentChannel>,
     #[crudcrate(non_db_attr = true, default = 0)]
     pub channel_qty_filled: usize,
+    #[crudcrate(non_db_attr = true, default = None)]
+    pub data_base64: Option<String>,
 }
 
 impl From<Model> for InstrumentExperiment {
@@ -58,6 +62,7 @@ impl From<Model> for InstrumentExperiment {
             project_id: model.project_id,
             channels: vec![],
             channel_qty_filled: 0,
+            data_base64: None,
         }
     }
 }
@@ -152,6 +157,87 @@ impl CRUDResource for InstrumentExperiment {
         Ok(obj)
     }
 
+    async fn create(
+        db: &DatabaseConnection,
+        create_model: Self::CreateModel,
+    ) -> Result<Self, DbErr> {
+        let Some(ref data_base64) = create_model.data_base64 else {
+            let active_model: Self::ActiveModelType = create_model.into();
+            // exec would try to unpack a uuid last_insert_id, which fails on sqlite
+            let id = active_model.id.clone().unwrap();
+            Self::EntityType::insert(active_model)
+                .exec_without_returning(db)
+                .await?;
+            return Self::get_one(db, id).await;
+        };
+
+        let parsed = super::services::process_instrument_data_base64(data_base64)
+            .map_err(|e| DbErr::Custom(format!("{UNSUPPORTED_FILE}{e}")))?;
+
+        let mut active_model: Self::ActiveModelType = create_model.clone().into();
+        if create_model.date.is_none() {
+            active_model.date = ActiveValue::Set(parsed.date);
+        }
+        if create_model.instrument_model.is_none() {
+            active_model.instrument_model = ActiveValue::Set(parsed.instrument_model);
+        }
+        if create_model.device_filename.is_none() {
+            active_model.device_filename = ActiveValue::Set(parsed.device_filename);
+        }
+        if create_model.data_source.is_none() {
+            active_model.data_source = ActiveValue::Set(parsed.data_source);
+        }
+        if create_model.init_e.is_none() {
+            active_model.init_e = ActiveValue::Set(parsed.init_e);
+        }
+        if create_model.sample_interval.is_none() {
+            active_model.sample_interval = ActiveValue::Set(parsed.sample_interval);
+        }
+        if create_model.run_time.is_none() {
+            active_model.run_time = ActiveValue::Set(parsed.run_time);
+        }
+        if create_model.quiet_time.is_none() {
+            active_model.quiet_time = ActiveValue::Set(parsed.quiet_time);
+        }
+        if create_model.sensitivity.is_none() {
+            active_model.sensitivity = ActiveValue::Set(parsed.sensitivity);
+        }
+
+        let txn = db.begin().await?;
+        let experiment_id = active_model.id.clone().unwrap();
+        Self::EntityType::insert(active_model)
+            .exec_without_returning(&txn)
+            .await?;
+
+        let mut channel_models = Vec::with_capacity(parsed.channel_names.len());
+        for (channel_name, raw_values) in
+            parsed.channel_names.iter().zip(&parsed.channel_values)
+        {
+            let time_values = serde_json::to_value(&parsed.time_values)
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+            let raw_values =
+                serde_json::to_value(raw_values).map_err(|e| DbErr::Custom(e.to_string()))?;
+            channel_models.push(super::channels::db::ActiveModel {
+                id: ActiveValue::Set(Uuid::new_v4()),
+                channel_name: ActiveValue::Set(channel_name.clone()),
+                experiment_id: ActiveValue::Set(experiment_id),
+                time_values: ActiveValue::Set(Some(time_values)),
+                raw_values: ActiveValue::Set(Some(raw_values)),
+                baseline_spline: ActiveValue::Set(None),
+                baseline_values: ActiveValue::Set(None),
+                baseline_chosen_points: ActiveValue::Set(None),
+                integral_chosen_pairs: ActiveValue::Set(None),
+                integral_results: ActiveValue::Set(None),
+            });
+        }
+        super::channels::db::Entity::insert_many(channel_models)
+            .exec_without_returning(&txn)
+            .await?;
+        txn.commit().await?;
+
+        Self::get_one(db, experiment_id).await
+    }
+
     async fn update(
         db: &DatabaseConnection,
         id: Uuid,
@@ -184,6 +270,7 @@ impl CRUDResource for InstrumentExperiment {
         vec![
             ("name", Self::ColumnType::Name),
             ("description", Self::ColumnType::Description),
+            ("project_id", Self::ColumnType::ProjectId),
         ]
     }
 }

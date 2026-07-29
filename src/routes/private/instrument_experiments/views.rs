@@ -2,7 +2,7 @@ use crate::common::auth::Role;
 use crate::routes::private::instrument_experiments::channels::db as channel_db;
 use crate::routes::private::instrument_experiments::db;
 use crate::routes::private::instrument_experiments::models::{
-    InstrumentExperiment, InstrumentExperimentCreate, InstrumentExperimentUpdate,
+    InstrumentExperiment, InstrumentExperimentCreate, InstrumentExperimentUpdate, UNSUPPORTED_FILE,
 };
 use axum_keycloak_auth::{
     PassthroughMode, instance::KeycloakAuthInstance, layer::KeycloakAuthLayer,
@@ -29,7 +29,7 @@ where
     let mut mutating_router = OpenApiRouter::new()
         .routes(routes!(get_one_handler))
         .routes(routes!(get_all_handler))
-        .routes(routes!(create_one_handler))
+        .routes(routes!(create_one_ingest_handler))
         .routes(routes!(update_one_handler))
         .routes(routes!(delete_one_handler))
         .routes(routes!(delete_many_handler))
@@ -56,6 +56,35 @@ where
     }
 
     mutating_router
+}
+
+#[utoipa::path(
+    post,
+    path = "",
+    request_body = InstrumentExperimentCreate,
+    responses(
+        (status = 201, description = "Experiment created successfully", body = InstrumentExperiment),
+        (status = 415, description = "Uploaded file could not be parsed as an instrument export", body = String),
+        (status = 500, description = "Internal server error", body = String)
+    ),
+    summary = format!("Create one {}", InstrumentExperiment::RESOURCE_NAME_SINGULAR),
+    description = "Creates a new experiment. If data_base64 contains an instrument export file, its preamble fills any fields missing from the payload and its data columns are ingested as channels."
+)]
+pub async fn create_one_ingest_handler(
+    State(db): State<DatabaseConnection>,
+    Json(create_model): Json<InstrumentExperimentCreate>,
+) -> Result<(StatusCode, Json<InstrumentExperiment>), (StatusCode, Json<String>)> {
+    match InstrumentExperiment::create(&db, create_model).await {
+        Ok(obj) => Ok((StatusCode::CREATED, Json(obj))),
+        Err(DbErr::Custom(msg)) if msg.starts_with(UNSUPPORTED_FILE) => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(msg.trim_start_matches(UNSUPPORTED_FILE).to_string()),
+        )),
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json("Internal Server Error".to_string()),
+        )),
+    }
 }
 
 #[utoipa::path(
@@ -446,4 +475,151 @@ pub async fn get_summary_data(
         csv_data.push(row);
     }
     Ok(Json(csv_data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use base64::{Engine as _, engine::general_purpose};
+    use sea_orm::{ConnectionTrait, Database, Schema};
+    use serde_json::{from_slice, json};
+    use tower::ServiceExt;
+
+    const CHI1000B_TAB: &str = include_str!("fixtures/chi1000b_tab.txt");
+
+    async fn setup_database() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        let project_stmt =
+            schema.create_table_from_entity(crate::routes::private::projects::db::Entity);
+        db.execute(backend.build(&project_stmt)).await.unwrap();
+        // The experiment and channel entities declare uuid primary keys without
+        // auto_increment = false, so the sqlite DDL needs AUTOINCREMENT stripped
+        let experiment_sql = backend
+            .build(&schema.create_table_from_entity(db::Entity))
+            .to_string()
+            .replace(" AUTOINCREMENT", "");
+        db.execute_unprepared(&experiment_sql).await.unwrap();
+        let channel_sql = backend
+            .build(&schema.create_table_from_entity(channel_db::Entity))
+            .to_string()
+            .replace(" AUTOINCREMENT", "");
+        db.execute_unprepared(&channel_sql).await.unwrap();
+        db
+    }
+
+    fn setup_app(db: &DatabaseConnection) -> Router {
+        let (router, _) = router(db, None).split_for_parts();
+        Router::new().nest("/api/instrument_experiments", router)
+    }
+
+    async fn post_experiment(app: &Router, payload: &serde_json::Value) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/instrument_experiments")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_one_ingest_handler_file_upload() {
+        let db = setup_database().await;
+        let app = setup_app(&db);
+        let data_base64 = format!(
+            "data:text/plain;base64,{}",
+            general_purpose::STANDARD.encode(CHI1000B_TAB)
+        );
+        let payload = json!({
+            "name": "Amperometric run",
+            "filename": "chi1000b_tab.txt",
+            "data_base64": data_base64
+        });
+
+        let response = post_experiment(&app, &payload).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = from_slice(&body_bytes).unwrap();
+
+        assert_eq!(body["name"], "Amperometric run");
+        assert_eq!(body["channels"].as_array().unwrap().len(), 8);
+        assert_eq!(body["instrument_model"], "CHI1000B");
+        assert!(body["date"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_create_one_ingest_handler_unparsable_file() {
+        let db = setup_database().await;
+        let app = setup_app(&db);
+        let data_base64 = format!(
+            "data:text/plain;base64,{}",
+            general_purpose::STANDARD.encode("this is not an instrument export")
+        );
+        let payload = json!({ "name": "Bad upload", "data_base64": data_base64 });
+
+        let response = post_experiment(&app, &payload).await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: String = from_slice(&body_bytes).unwrap();
+        assert!(body.contains("Time/s"));
+    }
+
+    #[tokio::test]
+    async fn test_get_all_handler_project_id_filter() {
+        let db = setup_database().await;
+        let app = setup_app(&db);
+        let project_id = Uuid::new_v4();
+
+        // Sqlite enforces the projects foreign key, so the row must exist
+        let project = crate::routes::private::projects::db::ActiveModel {
+            id: sea_orm::ActiveValue::Set(project_id),
+            name: sea_orm::ActiveValue::Set("Test project".to_string()),
+            description: sea_orm::ActiveValue::Set(None),
+            color: sea_orm::ActiveValue::Set("#000000".to_string()),
+            last_updated: sea_orm::ActiveValue::Set(chrono::Utc::now()),
+        };
+        crate::routes::private::projects::db::Entity::insert(project)
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let response = post_experiment(
+            &app,
+            &json!({ "name": "In project", "project_id": project_id }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = post_experiment(&app, &json!({ "name": "No project" })).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let filter = format!("%7B%22project_id%22%3A%22{project_id}%22%7D");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/instrument_experiments?filter={filter}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = from_slice(&body_bytes).unwrap();
+        let experiments = body.as_array().unwrap();
+        assert_eq!(experiments.len(), 1);
+        assert_eq!(experiments[0]["name"], "In project");
+        assert_eq!(experiments[0]["project_id"], project_id.to_string());
+    }
 }
