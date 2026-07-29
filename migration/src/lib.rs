@@ -22,6 +22,7 @@ mod m20250702_115754_create_enum_soil_type_sensor_profile;
 mod m20260226_000000_add_flux_redox_websites;
 mod m20260227_000000_precompute_sensor_averages;
 mod m20260302_000000_add_6h_continuous_aggregate;
+mod m20260729_000000_cascade_delete_experiment_channels;
 
 pub struct Migrator;
 
@@ -51,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260226_000000_add_flux_redox_websites::Migration),
             Box::new(m20260227_000000_precompute_sensor_averages::Migration),
             Box::new(m20260302_000000_add_6h_continuous_aggregate::Migration),
+            Box::new(m20260729_000000_cascade_delete_experiment_channels::Migration),
         ]
     }
 }
