@@ -13,6 +13,19 @@ use uuid::Uuid;
 
 use super::db::Model;
 
+/// Reads a JSON array column from the merged model, falling back to the stored value.
+fn merged_column<T: serde::de::DeserializeOwned + Default>(
+    updated: &ActiveValue<Option<Json>>,
+    original: &ActiveValue<Option<Json>>,
+) -> T {
+    for value in [updated, original] {
+        if let ActiveValue::Set(Some(json)) | ActiveValue::Unchanged(Some(json)) = value {
+            return serde_json::from_value(json.clone()).unwrap_or_default();
+        }
+    }
+    T::default()
+}
+
 /// The API model for an instrument experiment channel.
 #[derive(Clone, ToSchema, Serialize, Deserialize, ToCreateModel, ToUpdateModel)]
 #[active_model = "super::db::ActiveModel"]
@@ -167,49 +180,31 @@ impl CRUDResource for InstrumentExperimentChannel {
             }
         }
 
-        // --- Process integral_chosen_pairs ---
-        if let Some(integral_chosen_pairs_json) = update_model.integral_chosen_pairs {
-            let baseline_values: Vec<f64> = match &active_model.baseline_values {
-                ActiveValue::Set(Some(json)) | ActiveValue::Unchanged(Some(json)) => {
-                    serde_json::from_value(json.clone()).unwrap_or_default()
-                }
-                _ => match &original_model.baseline_values {
-                    ActiveValue::Set(Some(json)) | ActiveValue::Unchanged(Some(json)) => {
-                        serde_json::from_value(json.clone()).unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                },
-            };
+        // --- Recompute integrals ---
+        // The integrals depend on the baseline as much as on the ranges, so
+        // both are read back and the results rebuilt from whatever they are.
+        let baseline_values: Vec<f64> = merged_column(
+            &active_model.baseline_values,
+            &original_model.baseline_values,
+        );
+        let time_values: Vec<f64> =
+            merged_column(&active_model.time_values, &original_model.time_values);
+        let integral_chosen_pairs: Vec<serde_json::Value> = merged_column(
+            &active_model.integral_chosen_pairs,
+            &original_model.integral_chosen_pairs,
+        );
 
-            let time_values: Vec<f64> = match &active_model.time_values {
-                ActiveValue::Set(Some(json)) | ActiveValue::Unchanged(Some(json)) => {
-                    serde_json::from_value(json.clone()).unwrap_or_default()
-                }
-                _ => match &original_model.time_values {
-                    ActiveValue::Set(Some(json)) | ActiveValue::Unchanged(Some(json)) => {
-                        serde_json::from_value(json.clone()).unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                },
-            };
+        // Trapezoidal rule as in the lab's MATLAB reference
+        // (MER_MEO_Eval_003.m) and the lab-codes workflow default
+        let integral_results = super::tools::calculate_integrals_for_pairs(
+            &integral_chosen_pairs,
+            &baseline_values,
+            &time_values,
+            "trapz",
+        );
 
-            let integral_chosen_pairs: Vec<serde_json::Value> = integral_chosen_pairs_json
-                .map_or_else(Vec::new, |json| {
-                    serde_json::from_value(json).unwrap_or_default()
-                });
-
-            // Trapezoidal rule as in the lab's MATLAB reference
-            // (MER_MEO_Eval_003.m) and the lab-codes workflow default
-            let integral_results = super::tools::calculate_integrals_for_pairs(
-                &integral_chosen_pairs,
-                &baseline_values,
-                &time_values,
-                "trapz",
-            );
-
-            active_model.integral_results =
-                ActiveValue::Set(Some(serde_json::to_value(&integral_results).unwrap()));
-        }
+        active_model.integral_results =
+            ActiveValue::Set(Some(serde_json::to_value(&integral_results).unwrap()));
 
         // Execute the update in the database.
         let response_obj = active_model.update(db).await?;

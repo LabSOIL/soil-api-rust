@@ -75,6 +75,17 @@ pub fn calculate_spline(
 /// # Returns
 /// A `Vec<f64>` containing the baseline-filtered values.
 pub fn filter_baseline(y: &[f64], spline: &[f64]) -> Vec<f64> {
+    // zip stops at the shorter of the two, and everything downstream keys off
+    // index against the time axis.
+    if y.len() != spline.len() {
+        tracing::error!(
+            "Baseline spline has {} values against {} raw values; refusing to \
+             produce a misaligned corrected signal",
+            spline.len(),
+            y.len()
+        );
+        return Vec::new();
+    }
     y.iter().zip(spline.iter()).map(|(a, b)| a - b).collect()
 }
 
@@ -182,6 +193,15 @@ pub fn calculate_integral_for_range(x: &[f64], y: &[f64], integration_method: &s
     area / FARADAY_C_PER_MOL
 }
 
+/// Null for a non-finite value, which JSON cannot carry.
+fn finite_or_null(value: f64) -> serde_json::Value {
+    if value.is_finite() {
+        json!(value)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 /// Calculate the integral for each pair in the provided list.
 /// Each pair is expected to be a JSON object with the structure:
 /// { "start": {"x": value}, "end": {"x": value}, "`sample_name"`: "..." }
@@ -227,26 +247,59 @@ pub fn calculate_integrals_for_pairs(
 
         // Repeated timestamps are matched at their outer edges so the full
         // range is integrated regardless of which sample the click landed on.
-        let start_index = time_values.iter().position(|&v| (v - start).abs() < 1e-6);
-        let end_index = time_values.iter().rposition(|&v| (v - end).abs() < 1e-6);
+        // Ordered first, so a range picked right-to-left covers the same
+        // samples as the same range picked left-to-right.
+        let (lower, upper) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let start_index = time_values.iter().position(|&v| (v - lower).abs() < 1e-6);
+        let end_index = time_values.iter().rposition(|&v| (v - upper).abs() < 1e-6);
 
-        if let (Some(si), Some(ei)) = (start_index, end_index) {
+        let sample_name = pair
+            .get("sample_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("undefined")
+            .to_string();
+
+        // A range whose endpoints no longer land on a sample cannot be
+        // integrated, and stays visible as unresolved rather than vanishing
+        // while the plot goes on shading it.
+        let (Some(si), Some(ei)) = (start_index, end_index) else {
+            tracing::warn!(
+                "Range '{sample_name}' spanning {lower}..{upper} does not match the \
+                 channel's time values; reporting it as unresolved"
+            );
+            integration_results.push(json!({
+                "start": start,
+                "end": end,
+                "area": serde_json::Value::Null,
+                "sample_name": sample_name,
+                "unresolved": true,
+            }));
+            continue;
+        };
+
+        {
             let (si, ei) = if si <= ei { (si, ei) } else { (ei, si) };
             let x_slice = &time_values[si..=ei];
             let y_slice = &baseline_values[si..=ei];
             let area = calculate_integral_for_range(x_slice, y_slice, integration_method);
-            let sample_name = pair
-                .get("sample_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("undefined")
-                .to_string();
-            let result = json!({
+
+            if !area.is_finite() {
+                tracing::warn!(
+                    "Integral for '{sample_name}' over {start}..{end} is not finite \
+                     ({area}); reporting it as unavailable"
+                );
+            }
+
+            integration_results.push(json!({
                 "start": start,
                 "end": end,
-                "area": area,
+                "area": finite_or_null(area),
                 "sample_name": sample_name,
-            });
-            integration_results.push(result);
+            }));
         }
     }
 
@@ -320,6 +373,123 @@ mod tests {
         let simpson = integrate_simpson(&x, &y);
         assert!(simpson.is_finite(), "simpson returned {simpson}");
         assert!((simpson - integrate_trapz(&x, &y)).abs() / simpson.abs() < 0.05);
+    }
+
+    #[test]
+    fn test_non_finite_area_serialises_as_null() {
+        let time_values = vec![0.0, 10.0, 20.0];
+        let baseline_values = vec![0.0, f64::NAN, 0.0];
+        let pairs = vec![json!({"start": {"x": 0.0}, "end": {"x": 20.0}, "sample_name": "a"})];
+        let results = calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].get("area").unwrap().is_null());
+        // The row is still present, so a null area means "computed and failed"
+        assert_eq!(results[0].get("sample_name").unwrap(), "a");
+    }
+
+    // A range is a span, not a direction
+    #[test]
+    fn test_reversed_range_matches_forward_range() {
+        let (time_values, baseline_values) = repeated_timestamp_series();
+        let forward = json!({"start": {"x": 0.0}, "end": {"x": 90.0}, "sample_name": "f"});
+        let reversed = json!({"start": {"x": 90.0}, "end": {"x": 0.0}, "sample_name": "r"});
+
+        let area_of = |pair: serde_json::Value| {
+            calculate_integrals_for_pairs(&[pair], &baseline_values, &time_values, "trapz")[0]
+                .get("area")
+                .and_then(serde_json::Value::as_f64)
+                .expect("area should be a number")
+        };
+
+        assert!((area_of(forward) - area_of(reversed)).abs() < 1e-12);
+    }
+
+    // Both ends resolve outwards, whichever duplicate the click landed on
+    #[test]
+    fn test_repeated_boundary_timestamps_resolve_to_outer_edges() {
+        let time_values = vec![0.0, 10.0, 10.0, 20.0, 30.0, 30.0, 40.0];
+        let baseline_values = vec![1.0; 7];
+        let pairs = vec![json!({"start": {"x": 10.0}, "end": {"x": 30.0}, "sample_name": "a"})];
+
+        let area = calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz")[0]
+            .get("area")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap();
+
+        // 10..30 at unit height is 20 coulombs before the Faraday conversion
+        assert!((area - 20.0 / FARADAY_C_PER_MOL).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_zero_width_range_integrates_to_zero() {
+        let time_values = vec![0.0, 10.0, 20.0];
+        let baseline_values = vec![1.0, 2.0, 3.0];
+        let pairs = vec![json!({"start": {"x": 10.0}, "end": {"x": 10.0}, "sample_name": "a"})];
+
+        let area = calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz")[0]
+            .get("area")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap();
+
+        assert!(area.abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_unmatched_range_is_reported_not_dropped() {
+        let time_values = vec![0.0, 10.0, 20.0];
+        let baseline_values = vec![1.0, 1.0, 1.0];
+        let pairs = vec![
+            json!({"start": {"x": 0.0}, "end": {"x": 20.0}, "sample_name": "good"}),
+            json!({"start": {"x": 5.5}, "end": {"x": 17.5}, "sample_name": "stale"}),
+        ];
+
+        let results =
+            calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz");
+
+        assert_eq!(results.len(), 2, "the unmatched range should still appear");
+        let stale = results
+            .iter()
+            .find(|r| r.get("sample_name").unwrap() == "stale")
+            .unwrap();
+        assert_eq!(stale.get("unresolved").unwrap(), true);
+        assert!(stale.get("area").unwrap().is_null());
+    }
+
+    #[test]
+    fn test_misaligned_baseline_yields_no_results() {
+        let time_values = vec![0.0, 10.0, 20.0, 30.0];
+        let baseline_values = vec![1.0, 1.0];
+        let pairs = vec![json!({"start": {"x": 0.0}, "end": {"x": 30.0}, "sample_name": "a"})];
+
+        let results =
+            calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_filter_baseline_refuses_misaligned_input() {
+        assert_eq!(filter_baseline(&[1.0, 2.0, 3.0], &[0.5, 0.5, 0.5]).len(), 3);
+        assert!(filter_baseline(&[1.0, 2.0, 3.0], &[0.5, 0.5]).is_empty());
+    }
+
+    #[test]
+    fn test_no_pairs_yields_no_results() {
+        let time_values = vec![0.0, 10.0];
+        let baseline_values = vec![1.0, 1.0];
+        assert!(calculate_integrals_for_pairs(&[], &baseline_values, &time_values, "trapz").is_empty());
+    }
+
+    // An open pair is not integrable, and not a failure either
+    #[test]
+    fn test_open_pair_is_skipped() {
+        let time_values = vec![0.0, 10.0, 20.0];
+        let baseline_values = vec![1.0, 1.0, 1.0];
+        let pairs = vec![json!({"start": {"x": 0.0}, "sample_name": "open"})];
+
+        let results =
+            calculate_integrals_for_pairs(&pairs, &baseline_values, &time_values, "trapz");
+        assert!(results.is_empty());
     }
 
     #[test]
